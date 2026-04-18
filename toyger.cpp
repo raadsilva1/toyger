@@ -29,6 +29,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -389,9 +390,12 @@ static bool vaddr_to_offset(const std::vector<unsigned char> &bytes,
 static bool needed_library_name_looks_gui(const std::string &name) {
     static const std::vector<std::string> gui_libs = {
         "libx11", "libxt", "libxm", "libxaw", "libxmu",
+        "libxext", "libxrender", "libxrandr", "libxi",
+        "libxcursor", "libxinerama", "libxfixes",
         "libgtk", "libgdk", "libqt", "libwx", "libsdl",
         "libfltk", "libglfw", "libtk", "libfox",
-        "libwayland-client"
+        "libwayland-client", "libwayland-egl",
+        "libwayland-cursor", "libxkbcommon"
     };
 
     std::string lower = to_lower(name);
@@ -493,14 +497,29 @@ static bool elf_dynamic_libraries_look_gui_t(const std::vector<unsigned char> &b
 static bool raw_binary_contains_gui_symbols(const std::vector<unsigned char> &bytes) {
     static const std::vector<std::string> symbols = {
         "XOpenDisplay",
+        "XCreateWindow",
+        "XMapWindow",
+        "XMapRaised",
+        "XInternAtom",
+        "XGetVisualInfo",
+        "XSetWMProtocols",
         "XtAppInitialize",
         "XmCreate",
         "gtk_init",
         "gtk_application_new",
+        "gtk_window_new",
         "QApplication",
         "QGuiApplication",
+        "QWidget",
         "SDL_Init",
+        "SDL_CreateWindow",
         "glfwInit",
+        "glXChooseVisual",
+        "glXCreateContext",
+        "eglInitialize",
+        "eglCreateWindowSurface",
+        "wl_display_connect",
+        "wl_compositor_create_surface",
         "Tk_Init"
     };
 
@@ -604,6 +623,351 @@ static bool is_known_gui_interpreter(const std::vector<std::string> &tokens) {
            interp == "expectk";
 }
 
+static std::string trim_ascii(const std::string &s) {
+    std::size_t start = 0;
+    while (start < s.size() &&
+           std::isspace(static_cast<unsigned char>(s[start]))) {
+        ++start;
+    }
+
+    std::size_t end = s.size();
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+        --end;
+    }
+
+    return s.substr(start, end - start);
+}
+
+static bool is_shell_name_start(char ch) {
+    unsigned char uch = static_cast<unsigned char>(ch);
+    return std::isalpha(uch) || ch == '_';
+}
+
+static bool is_shell_name_char(char ch) {
+    unsigned char uch = static_cast<unsigned char>(ch);
+    return std::isalnum(uch) || ch == '_';
+}
+
+static std::optional<std::string> lookup_shell_variable(
+    const std::vector<std::pair<std::string, std::string>> &vars,
+    const std::string &name) {
+    for (auto it = vars.rbegin(); it != vars.rend(); ++it) {
+        if (it->first == name) {
+            return it->second;
+        }
+    }
+
+    const char *env = std::getenv(name.c_str());
+    if (env != nullptr) {
+        return std::string(env);
+    }
+
+    return std::nullopt;
+}
+
+static bool append_expanded_shell_variable(
+    const std::string &input,
+    std::size_t &i,
+    const std::vector<std::pair<std::string, std::string>> &vars,
+    std::string &out) {
+    if (input[i] != '$') {
+        return false;
+    }
+
+    if (i + 1 >= input.size()) {
+        out.push_back('$');
+        return true;
+    }
+
+    std::size_t name_start = 0;
+    std::size_t name_end = 0;
+
+    if (input[i + 1] == '{') {
+        name_start = i + 2;
+        name_end = name_start;
+
+        while (name_end < input.size() && input[name_end] != '}') {
+            ++name_end;
+        }
+
+        if (name_end >= input.size() || name_end == name_start) {
+            return false;
+        }
+
+        for (std::size_t p = name_start; p < name_end; ++p) {
+            if ((p == name_start && !is_shell_name_start(input[p])) ||
+                !is_shell_name_char(input[p])) {
+                return false;
+            }
+        }
+
+        i = name_end;
+    } else {
+        if (!is_shell_name_start(input[i + 1])) {
+            out.push_back('$');
+            return true;
+        }
+
+        name_start = i + 1;
+        name_end = name_start + 1;
+
+        while (name_end < input.size() &&
+               is_shell_name_char(input[name_end])) {
+            ++name_end;
+        }
+
+        i = name_end - 1;
+    }
+
+    const std::string name = input.substr(name_start, name_end - name_start);
+    auto value = lookup_shell_variable(vars, name);
+    if (value.has_value()) {
+        out += *value;
+    }
+
+    return true;
+}
+
+static bool extract_first_shell_word_expanded(
+    const std::string &text,
+    const std::vector<std::pair<std::string, std::string>> &vars,
+    std::string &out,
+    bool &had_word) {
+    out.clear();
+    had_word = false;
+
+    enum class QuoteMode {
+        Plain,
+        Single,
+        Double
+    };
+
+    QuoteMode quote = QuoteMode::Plain;
+    bool escaping = false;
+
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        unsigned char uch = static_cast<unsigned char>(text[i]);
+        char ch = static_cast<char>(uch);
+
+        if (quote == QuoteMode::Plain) {
+            if (escaping) {
+                out.push_back(ch);
+                had_word = true;
+                escaping = false;
+                continue;
+            }
+
+            if (ch == '\\') {
+                escaping = true;
+                had_word = true;
+                continue;
+            }
+
+            if (std::isspace(uch)) {
+                if (had_word) {
+                    break;
+                }
+                continue;
+            }
+
+            if (ch == '\'') {
+                had_word = true;
+                quote = QuoteMode::Single;
+                continue;
+            }
+
+            if (ch == '"') {
+                had_word = true;
+                quote = QuoteMode::Double;
+                continue;
+            }
+
+            if (ch == '$') {
+                had_word = true;
+                if (!append_expanded_shell_variable(text, i, vars, out)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (ch == '|' || ch == '&' || ch == ';' || ch == '<' || ch == '>') {
+                return had_word;
+            }
+
+            had_word = true;
+            out.push_back(ch);
+            continue;
+        }
+
+        if (quote == QuoteMode::Single) {
+            if (ch == '\'') {
+                quote = QuoteMode::Plain;
+            } else {
+                out.push_back(ch);
+            }
+            continue;
+        }
+
+        if (escaping) {
+            if (ch == '"' || ch == '\\' || ch == '$') {
+                out.push_back(ch);
+            } else {
+                out.push_back('\\');
+                out.push_back(ch);
+            }
+            escaping = false;
+            continue;
+        }
+
+        if (ch == '\\') {
+            escaping = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            quote = QuoteMode::Plain;
+            continue;
+        }
+
+        if (ch == '$') {
+            if (!append_expanded_shell_variable(text, i, vars, out)) {
+                return false;
+            }
+            continue;
+        }
+
+        out.push_back(ch);
+    }
+
+    if (escaping) {
+        out.push_back('\\');
+    }
+
+    return quote == QuoteMode::Plain;
+}
+
+static bool parse_simple_shell_assignment(
+    const std::string &line,
+    const std::vector<std::pair<std::string, std::string>> &vars,
+    std::string &name_out,
+    std::string &value_out) {
+    const std::string trimmed = trim_ascii(line);
+    if (trimmed.empty() || trimmed[0] == '#') {
+        return false;
+    }
+
+    if (!is_shell_name_start(trimmed[0])) {
+        return false;
+    }
+
+    std::size_t pos = 1;
+    while (pos < trimmed.size() && is_shell_name_char(trimmed[pos])) {
+        ++pos;
+    }
+
+    if (pos >= trimmed.size() || trimmed[pos] != '=') {
+        return false;
+    }
+
+    name_out = trimmed.substr(0, pos);
+    value_out.clear();
+
+    const std::string value_expr = trimmed.substr(pos + 1);
+    if (value_expr.empty()) {
+        return true;
+    }
+
+    bool had_word = false;
+    if (!extract_first_shell_word_expanded(value_expr, vars, value_out, had_word)) {
+        return false;
+    }
+
+    return had_word || value_expr.empty();
+}
+
+static bool is_shell_interpreter(const std::vector<std::string> &tokens) {
+    if (tokens.empty()) {
+        return false;
+    }
+
+    std::string interp = basename_of(tokens[0]);
+
+    if (interp == "env") {
+        for (std::size_t i = 1; i < tokens.size(); ++i) {
+            if (!tokens[i].empty() && tokens[i][0] != '-') {
+                interp = basename_of(tokens[i]);
+                break;
+            }
+        }
+    }
+
+    interp = to_lower(interp);
+
+    return interp == "sh"   ||
+           interp == "ksh"  ||
+           interp == "oksh" ||
+           interp == "mksh" ||
+           interp == "bash" ||
+           interp == "zsh"  ||
+           interp == "dash" ||
+           interp == "ash"  ||
+           interp == "csh"  ||
+           interp == "tcsh";
+}
+
+static std::optional<std::string> resolve_shell_wrapper_exec_target(const std::string &path) {
+    auto shebang = read_shebang_tokens(path);
+    if (!shebang.has_value() || !is_shell_interpreter(*shebang)) {
+        return std::nullopt;
+    }
+
+    std::string prefix;
+    if (!read_prefix_text(path, prefix, 32768)) {
+        return std::nullopt;
+    }
+
+    std::vector<std::pair<std::string, std::string>> vars;
+
+    std::size_t line_start = 0;
+    while (line_start <= prefix.size()) {
+        std::size_t line_end = prefix.find('\n', line_start);
+        std::string line = prefix.substr(
+            line_start,
+            line_end == std::string::npos ? std::string::npos : line_end - line_start
+        );
+
+        const std::string trimmed = trim_ascii(line);
+        if (!trimmed.empty() && trimmed[0] != '#') {
+            std::string name;
+            std::string value;
+
+            if (parse_simple_shell_assignment(trimmed, vars, name, value)) {
+                vars.emplace_back(name, value);
+            } else if (starts_with(trimmed, "exec") &&
+                       trimmed.size() > 4 &&
+                       std::isspace(static_cast<unsigned char>(trimmed[4]))) {
+                std::string target;
+                bool had_word = false;
+
+                if (!extract_first_shell_word_expanded(trimmed.substr(4), vars, target, had_word) ||
+                    !had_word || target.empty()) {
+                    return std::nullopt;
+                }
+
+                return resolve_executable(target);
+            }
+        }
+
+        if (line_end == std::string::npos) {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+
+    return std::nullopt;
+}
+
 static bool script_text_looks_gui(const std::string &path) {
     std::string prefix;
     if (!read_prefix_text(path, prefix, 16384)) {
@@ -639,7 +1003,11 @@ static bool script_text_looks_gui(const std::string &path) {
     return false;
 }
 
-static bool command_looks_gui(const std::string &resolved_path) {
+static bool command_looks_gui_impl(const std::string &resolved_path, int depth) {
+    if (depth > 4) {
+        return false;
+    }
+
     if (elf_looks_gui(resolved_path)) {
         return true;
     }
@@ -657,7 +1025,16 @@ static bool command_looks_gui(const std::string &resolved_path) {
         return true;
     }
 
+    auto wrapped_target = resolve_shell_wrapper_exec_target(resolved_path);
+    if (wrapped_target && *wrapped_target != resolved_path) {
+        return command_looks_gui_impl(*wrapped_target, depth + 1);
+    }
+
     return false;
+}
+
+static bool command_looks_gui(const std::string &resolved_path) {
+    return command_looks_gui_impl(resolved_path, 0);
 }
 
 static LaunchPrep prepare_launch(const std::string &raw_input) {
