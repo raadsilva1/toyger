@@ -1037,6 +1037,261 @@ static bool command_looks_gui(const std::string &resolved_path) {
     return command_looks_gui_impl(resolved_path, 0);
 }
 
+static bool needed_library_name_looks_terminal(const std::string &name) {
+    static const std::vector<std::string> terminal_libs = {
+        "libcurses",
+        "libncurses",
+        "libtinfo",
+        "libtermcap",
+        "libreadline",
+        "libedit",
+        "libnewt",
+        "libdialog"
+    };
+
+    std::string lower = to_lower(name);
+    for (const auto &token : terminal_libs) {
+        if (lower.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename Ehdr, typename Phdr, typename Dyn, typename Addr>
+static bool elf_dynamic_libraries_look_terminal_t(const std::vector<unsigned char> &bytes) {
+    if (bytes.size() < sizeof(Ehdr)) {
+        return false;
+    }
+
+    const auto *eh = reinterpret_cast<const Ehdr *>(bytes.data());
+    if (eh->e_phoff == 0 || eh->e_phnum == 0) {
+        return false;
+    }
+
+    if (eh->e_phoff + (static_cast<std::size_t>(eh->e_phnum) * sizeof(Phdr)) > bytes.size()) {
+        return false;
+    }
+
+    const auto *phdrs = reinterpret_cast<const Phdr *>(bytes.data() + eh->e_phoff);
+
+    const Dyn *dyn = nullptr;
+    std::size_t dyn_count = 0;
+
+    for (std::size_t i = 0; i < eh->e_phnum; ++i) {
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            if (phdrs[i].p_offset + phdrs[i].p_filesz > bytes.size()) {
+                return false;
+            }
+            dyn = reinterpret_cast<const Dyn *>(bytes.data() + phdrs[i].p_offset);
+            dyn_count = static_cast<std::size_t>(phdrs[i].p_filesz / sizeof(Dyn));
+            break;
+        }
+    }
+
+    if (dyn == nullptr || dyn_count == 0) {
+        return false;
+    }
+
+    Addr strtab_vaddr = 0;
+    std::size_t strsz = 0;
+    std::vector<std::size_t> needed_offsets;
+
+    for (std::size_t i = 0; i < dyn_count; ++i) {
+        if (dyn[i].d_tag == DT_NULL) {
+            break;
+        }
+
+        if (dyn[i].d_tag == DT_STRTAB) {
+            strtab_vaddr = static_cast<Addr>(dyn[i].d_un.d_ptr);
+        } else if (dyn[i].d_tag == DT_STRSZ) {
+            strsz = static_cast<std::size_t>(dyn[i].d_un.d_val);
+        } else if (dyn[i].d_tag == DT_NEEDED) {
+            needed_offsets.push_back(static_cast<std::size_t>(dyn[i].d_un.d_val));
+        }
+    }
+
+    if (strtab_vaddr == 0 || strsz == 0 || needed_offsets.empty()) {
+        return false;
+    }
+
+    std::size_t strtab_off = 0;
+    if (!vaddr_to_offset<Addr>(bytes, strtab_vaddr, phdrs, eh->e_phnum, sizeof(Phdr), strtab_off)) {
+        return false;
+    }
+
+    if (strtab_off >= bytes.size()) {
+        return false;
+    }
+
+    const std::size_t max_strsz = bytes.size() - strtab_off;
+    if (strsz > max_strsz) {
+        strsz = max_strsz;
+    }
+
+    const char *strtab = reinterpret_cast<const char *>(bytes.data() + strtab_off);
+
+    for (std::size_t off : needed_offsets) {
+        if (off >= strsz) {
+            continue;
+        }
+
+        std::string name(strtab + off);
+        if (needed_library_name_looks_terminal(name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool raw_binary_contains_terminal_symbols(const std::vector<unsigned char> &bytes) {
+    static const std::vector<std::string> symbols = {
+        "initscr",
+        "newterm",
+        "setupterm",
+        "readline",
+        "rl_initialize",
+        "el_init",
+        "tgetent"
+    };
+
+    for (const auto &sym : symbols) {
+        auto it = std::search(bytes.begin(), bytes.end(), sym.begin(), sym.end());
+        if (it != bytes.end()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool elf_looks_terminal(const std::string &path) {
+    std::vector<unsigned char> bytes;
+    if (!read_file(path, bytes)) {
+        return false;
+    }
+
+    if (bytes.size() < EI_NIDENT) {
+        return false;
+    }
+
+    if (bytes[0] != ELFMAG0 || bytes[1] != ELFMAG1 ||
+        bytes[2] != ELFMAG2 || bytes[3] != ELFMAG3) {
+        return false;
+    }
+
+    bool terminal_by_needed = false;
+
+    if (bytes[EI_CLASS] == ELFCLASS64) {
+        terminal_by_needed =
+            elf_dynamic_libraries_look_terminal_t<Elf64_Ehdr, Elf64_Phdr, Elf64_Dyn, Elf64_Addr>(bytes);
+    } else if (bytes[EI_CLASS] == ELFCLASS32) {
+        terminal_by_needed =
+            elf_dynamic_libraries_look_terminal_t<Elf32_Ehdr, Elf32_Phdr, Elf32_Dyn, Elf32_Addr>(bytes);
+    }
+
+    if (terminal_by_needed) {
+        return true;
+    }
+
+    return raw_binary_contains_terminal_symbols(bytes);
+}
+
+static bool script_text_looks_terminal(const std::string &path) {
+    std::string prefix;
+    if (!read_prefix_text(path, prefix, 16384)) {
+        return false;
+    }
+
+    std::string lower = to_lower(prefix);
+
+    static const std::vector<std::string> markers = {
+        "curses",
+        "ncurses",
+        "readline",
+        "prompt_toolkit",
+        "urwid",
+        "blessed",
+        "npyscreen",
+        "dialog",
+        "whiptail",
+        "initscr",
+        "newterm"
+    };
+
+    for (const auto &m : markers) {
+        if (lower.find(m) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool command_prefers_xterm(const std::string &resolved_path) {
+    if (command_looks_gui(resolved_path)) {
+        return false;
+    }
+
+    if (elf_looks_terminal(resolved_path)) {
+        return true;
+    }
+
+    std::string base = to_lower(basename_of(resolved_path));
+    static const std::vector<std::string> terminal_names = {
+        "sh", "csh", "ksh", "oksh", "mksh", "bash", "zsh", "tcsh", "fish",
+        "vi", "view", "vim", "nvim", "nano", "ed", "ex",
+        "less", "more", "most", "man",
+        "top", "htop", "btop", "atop",
+        "tmux", "screen",
+        "ssh", "sftp", "ftp",
+        "lynx", "links", "elinks", "w3m",
+        "mutt", "neomutt", "mail", "mailx",
+        "irssi", "weechat", "mc", "ranger"
+    };
+
+    for (const auto &name : terminal_names) {
+        if (base == name) {
+            return true;
+        }
+    }
+
+    auto shebang = read_shebang_tokens(resolved_path);
+    if (!shebang) {
+        return false;
+    }
+
+    std::string interp = basename_of((*shebang)[0]);
+
+    if (interp == "env") {
+        for (std::size_t i = 1; i < shebang->size(); ++i) {
+            if (!(*shebang)[i].empty() && (*shebang)[i][0] != '-') {
+                interp = basename_of((*shebang)[i]);
+                break;
+            }
+        }
+    }
+
+    interp = to_lower(interp);
+
+    static const std::vector<std::string> terminal_interpreters = {
+        "sh", "csh", "ksh", "oksh", "mksh", "bash", "zsh", "tcsh", "fish",
+        "python", "python2", "python3",
+        "perl", "ruby", "lua", "php",
+        "tclsh", "expect", "awk", "gawk", "mawk",
+        "node", "nodejs"
+    };
+
+    for (const auto &name : terminal_interpreters) {
+        if (interp == name || starts_with(interp, name)) {
+            return script_text_looks_terminal(resolved_path);
+        }
+    }
+
+    return false;
+}
+
 static LaunchPrep prepare_launch(const std::string &raw_input) {
     LaunchPrep prep;
 
@@ -1052,9 +1307,9 @@ static LaunchPrep prepare_launch(const std::string &raw_input) {
         return prep;
     }
 
-    const bool is_gui = command_looks_gui(*resolved);
+    const bool launch_in_xterm = command_prefers_xterm(*resolved);
 
-    if (is_gui) {
+    if (!launch_in_xterm) {
         prep.exec_argv = parsed.argv;
         prep.exec_argv[0] = *resolved;
         prep.ok = true;
