@@ -29,6 +29,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -56,6 +57,11 @@ struct LaunchPrep {
     bool ok{false};
     std::vector<std::string> exec_argv;
     std::string error;
+};
+
+enum class LaunchDisposition {
+    DirectDetached,
+    LaunchInXterm
 };
 
 static std::string to_lower(std::string s) {
@@ -387,242 +393,6 @@ static bool vaddr_to_offset(const std::vector<unsigned char> &bytes,
     return false;
 }
 
-static bool needed_library_name_looks_gui(const std::string &name) {
-    static const std::vector<std::string> gui_libs = {
-        "libx11", "libxt", "libxm", "libxaw", "libxmu",
-        "libxext", "libxrender", "libxrandr", "libxi",
-        "libxcursor", "libxinerama", "libxfixes",
-        "libgtk", "libgdk", "libqt", "libwx", "libsdl",
-        "libfltk", "libglfw", "libtk", "libfox",
-        "libwayland-client", "libwayland-egl",
-        "libwayland-cursor", "libxkbcommon"
-    };
-
-    std::string lower = to_lower(name);
-    for (const auto &token : gui_libs) {
-        if (lower.find(token) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-template <typename Ehdr, typename Phdr, typename Dyn, typename Addr>
-static bool elf_dynamic_libraries_look_gui_t(const std::vector<unsigned char> &bytes) {
-    if (bytes.size() < sizeof(Ehdr)) {
-        return false;
-    }
-
-    const auto *eh = reinterpret_cast<const Ehdr *>(bytes.data());
-    if (eh->e_phoff == 0 || eh->e_phnum == 0) {
-        return false;
-    }
-
-    if (eh->e_phoff + (static_cast<std::size_t>(eh->e_phnum) * sizeof(Phdr)) > bytes.size()) {
-        return false;
-    }
-
-    const auto *phdrs = reinterpret_cast<const Phdr *>(bytes.data() + eh->e_phoff);
-
-    const Dyn *dyn = nullptr;
-    std::size_t dyn_count = 0;
-
-    for (std::size_t i = 0; i < eh->e_phnum; ++i) {
-        if (phdrs[i].p_type == PT_DYNAMIC) {
-            if (phdrs[i].p_offset + phdrs[i].p_filesz > bytes.size()) {
-                return false;
-            }
-            dyn = reinterpret_cast<const Dyn *>(bytes.data() + phdrs[i].p_offset);
-            dyn_count = static_cast<std::size_t>(phdrs[i].p_filesz / sizeof(Dyn));
-            break;
-        }
-    }
-
-    if (dyn == nullptr || dyn_count == 0) {
-        return false;
-    }
-
-    Addr strtab_vaddr = 0;
-    std::size_t strsz = 0;
-    std::vector<std::size_t> needed_offsets;
-
-    for (std::size_t i = 0; i < dyn_count; ++i) {
-        if (dyn[i].d_tag == DT_NULL) {
-            break;
-        }
-
-        if (dyn[i].d_tag == DT_STRTAB) {
-            strtab_vaddr = static_cast<Addr>(dyn[i].d_un.d_ptr);
-        } else if (dyn[i].d_tag == DT_STRSZ) {
-            strsz = static_cast<std::size_t>(dyn[i].d_un.d_val);
-        } else if (dyn[i].d_tag == DT_NEEDED) {
-            needed_offsets.push_back(static_cast<std::size_t>(dyn[i].d_un.d_val));
-        }
-    }
-
-    if (strtab_vaddr == 0 || strsz == 0 || needed_offsets.empty()) {
-        return false;
-    }
-
-    std::size_t strtab_off = 0;
-    if (!vaddr_to_offset<Addr>(bytes, strtab_vaddr, phdrs, eh->e_phnum, sizeof(Phdr), strtab_off)) {
-        return false;
-    }
-
-    if (strtab_off >= bytes.size()) {
-        return false;
-    }
-
-    const std::size_t max_strsz = bytes.size() - strtab_off;
-    if (strsz > max_strsz) {
-        strsz = max_strsz;
-    }
-
-    const char *strtab = reinterpret_cast<const char *>(bytes.data() + strtab_off);
-
-    for (std::size_t off : needed_offsets) {
-        if (off >= strsz) {
-            continue;
-        }
-
-        std::string name(strtab + off);
-        if (needed_library_name_looks_gui(name)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool raw_binary_contains_gui_symbols(const std::vector<unsigned char> &bytes) {
-    static const std::vector<std::string> symbols = {
-        "XOpenDisplay",
-        "XCreateWindow",
-        "XMapWindow",
-        "XMapRaised",
-        "XInternAtom",
-        "XGetVisualInfo",
-        "XSetWMProtocols",
-        "XtAppInitialize",
-        "XmCreate",
-        "gtk_init",
-        "gtk_application_new",
-        "gtk_window_new",
-        "QApplication",
-        "QGuiApplication",
-        "QWidget",
-        "SDL_Init",
-        "SDL_CreateWindow",
-        "glfwInit",
-        "glXChooseVisual",
-        "glXCreateContext",
-        "eglInitialize",
-        "eglCreateWindowSurface",
-        "wl_display_connect",
-        "wl_compositor_create_surface",
-        "Tk_Init"
-    };
-
-    for (const auto &sym : symbols) {
-        auto it = std::search(bytes.begin(), bytes.end(), sym.begin(), sym.end());
-        if (it != bytes.end()) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool elf_looks_gui(const std::string &path) {
-    std::vector<unsigned char> bytes;
-    if (!read_file(path, bytes)) {
-        return false;
-    }
-
-    if (bytes.size() < EI_NIDENT) {
-        return false;
-    }
-
-    if (bytes[0] != ELFMAG0 || bytes[1] != ELFMAG1 ||
-        bytes[2] != ELFMAG2 || bytes[3] != ELFMAG3) {
-        return false;
-    }
-
-    bool gui_by_needed = false;
-
-    if (bytes[EI_CLASS] == ELFCLASS64) {
-        gui_by_needed = elf_dynamic_libraries_look_gui_t<Elf64_Ehdr, Elf64_Phdr, Elf64_Dyn, Elf64_Addr>(bytes);
-    } else if (bytes[EI_CLASS] == ELFCLASS32) {
-        gui_by_needed = elf_dynamic_libraries_look_gui_t<Elf32_Ehdr, Elf32_Phdr, Elf32_Dyn, Elf32_Addr>(bytes);
-    }
-
-    if (gui_by_needed) {
-        return true;
-    }
-
-    return raw_binary_contains_gui_symbols(bytes);
-}
-
-static std::optional<std::vector<std::string>> read_shebang_tokens(const std::string &path) {
-    std::string prefix;
-    if (!read_prefix_text(path, prefix, 4096)) {
-        return std::nullopt;
-    }
-
-    if (!starts_with(prefix, "#!")) {
-        return std::nullopt;
-    }
-
-    std::size_t line_end = prefix.find('\n');
-    std::string line = prefix.substr(2, line_end == std::string::npos ? std::string::npos : line_end - 2);
-
-    std::vector<std::string> tokens;
-    std::string current;
-    for (char ch : line) {
-        if (std::isspace(static_cast<unsigned char>(ch))) {
-            if (!current.empty()) {
-                tokens.push_back(current);
-                current.clear();
-            }
-        } else {
-            current.push_back(ch);
-        }
-    }
-    if (!current.empty()) {
-        tokens.push_back(current);
-    }
-
-    if (tokens.empty()) {
-        return std::nullopt;
-    }
-
-    return tokens;
-}
-
-static bool is_known_gui_interpreter(const std::vector<std::string> &tokens) {
-    if (tokens.empty()) {
-        return false;
-    }
-
-    std::string interp = basename_of(tokens[0]);
-
-    if (interp == "env") {
-        for (std::size_t i = 1; i < tokens.size(); ++i) {
-            if (!tokens[i].empty() && tokens[i][0] != '-') {
-                interp = basename_of(tokens[i]);
-                break;
-            }
-        }
-    }
-
-    interp = to_lower(interp);
-
-    return interp == "wish" ||
-           interp == "wish8.6" ||
-           interp == "wish8.5" ||
-           interp == "expectk";
-}
-
 static std::string trim_ascii(const std::string &s) {
     std::size_t start = 0;
     while (start < s.size() &&
@@ -886,155 +656,25 @@ static bool parse_simple_shell_assignment(
     return had_word || value_expr.empty();
 }
 
-static bool is_shell_interpreter(const std::vector<std::string> &tokens) {
-    if (tokens.empty()) {
-        return false;
-    }
-
-    std::string interp = basename_of(tokens[0]);
-
-    if (interp == "env") {
-        for (std::size_t i = 1; i < tokens.size(); ++i) {
-            if (!tokens[i].empty() && tokens[i][0] != '-') {
-                interp = basename_of(tokens[i]);
-                break;
-            }
-        }
-    }
-
-    interp = to_lower(interp);
-
-    return interp == "sh"   ||
-           interp == "ksh"  ||
-           interp == "oksh" ||
-           interp == "mksh" ||
-           interp == "bash" ||
-           interp == "zsh"  ||
-           interp == "dash" ||
-           interp == "ash"  ||
-           interp == "csh"  ||
-           interp == "tcsh";
-}
-
-static std::optional<std::string> resolve_shell_wrapper_exec_target(const std::string &path) {
-    auto shebang = read_shebang_tokens(path);
-    if (!shebang.has_value() || !is_shell_interpreter(*shebang)) {
-        return std::nullopt;
-    }
-
-    std::string prefix;
-    if (!read_prefix_text(path, prefix, 32768)) {
-        return std::nullopt;
-    }
-
-    std::vector<std::pair<std::string, std::string>> vars;
-
-    std::size_t line_start = 0;
-    while (line_start <= prefix.size()) {
-        std::size_t line_end = prefix.find('\n', line_start);
-        std::string line = prefix.substr(
-            line_start,
-            line_end == std::string::npos ? std::string::npos : line_end - line_start
-        );
-
-        const std::string trimmed = trim_ascii(line);
-        if (!trimmed.empty() && trimmed[0] != '#') {
-            std::string name;
-            std::string value;
-
-            if (parse_simple_shell_assignment(trimmed, vars, name, value)) {
-                vars.emplace_back(name, value);
-            } else if (starts_with(trimmed, "exec") &&
-                       trimmed.size() > 4 &&
-                       std::isspace(static_cast<unsigned char>(trimmed[4]))) {
-                std::string target;
-                bool had_word = false;
-
-                if (!extract_first_shell_word_expanded(trimmed.substr(4), vars, target, had_word) ||
-                    !had_word || target.empty()) {
-                    return std::nullopt;
-                }
-
-                return resolve_executable(target);
-            }
-        }
-
-        if (line_end == std::string::npos) {
-            break;
-        }
-        line_start = line_end + 1;
-    }
-
-    return std::nullopt;
-}
-
-static bool script_text_looks_gui(const std::string &path) {
-    std::string prefix;
-    if (!read_prefix_text(path, prefix, 16384)) {
-        return false;
-    }
-
-    std::string lower = to_lower(prefix);
-
-    static const std::vector<std::string> markers = {
-        "tkinter",
-        "pyqt",
-        "pyside",
-        "gi.repository.gtk",
-        "qtwidgets",
-        "gtk.application",
-        "import gtk",
-        "wx.app",
-        "wxpython",
-        "fltk",
-        "glfw",
-        "sdl",
-        "wish",
-        "zenity",
-        "yad"
+static bool needed_library_name_looks_gui(const std::string &name) {
+    static const std::vector<std::string> gui_libs = {
+        "libx11", "libxt", "libxm", "libxaw", "libxmu",
+        "libxext", "libxrender", "libxrandr", "libxi",
+        "libxcursor", "libxinerama", "libxfixes",
+        "libgtk", "libgdk", "libqt", "libwx", "libsdl",
+        "libfltk", "libglfw", "libtk", "libfox",
+        "libwayland-client", "libwayland-egl",
+        "libwayland-cursor", "libxkbcommon"
     };
 
-    for (const auto &m : markers) {
-        if (lower.find(m) != std::string::npos) {
+    const std::string lower = to_lower(name);
+    for (const auto &token : gui_libs) {
+        if (lower.find(token) != std::string::npos) {
             return true;
         }
     }
 
     return false;
-}
-
-static bool command_looks_gui_impl(const std::string &resolved_path, int depth) {
-    if (depth > 4) {
-        return false;
-    }
-
-    if (elf_looks_gui(resolved_path)) {
-        return true;
-    }
-
-    auto shebang = read_shebang_tokens(resolved_path);
-    if (!shebang) {
-        return false;
-    }
-
-    if (is_known_gui_interpreter(*shebang)) {
-        return true;
-    }
-
-    if (script_text_looks_gui(resolved_path)) {
-        return true;
-    }
-
-    auto wrapped_target = resolve_shell_wrapper_exec_target(resolved_path);
-    if (wrapped_target && *wrapped_target != resolved_path) {
-        return command_looks_gui_impl(*wrapped_target, depth + 1);
-    }
-
-    return false;
-}
-
-static bool command_looks_gui(const std::string &resolved_path) {
-    return command_looks_gui_impl(resolved_path, 0);
 }
 
 static bool needed_library_name_looks_terminal(const std::string &name) {
@@ -1049,12 +689,100 @@ static bool needed_library_name_looks_terminal(const std::string &name) {
         "libdialog"
     };
 
-    std::string lower = to_lower(name);
+    const std::string lower = to_lower(name);
     for (const auto &token : terminal_libs) {
         if (lower.find(token) != std::string::npos) {
             return true;
         }
     }
+
+    return false;
+}
+
+template <typename Ehdr, typename Phdr, typename Dyn, typename Addr>
+static bool elf_dynamic_libraries_look_gui_t(const std::vector<unsigned char> &bytes) {
+    if (bytes.size() < sizeof(Ehdr)) {
+        return false;
+    }
+
+    const auto *eh = reinterpret_cast<const Ehdr *>(bytes.data());
+    if (eh->e_phoff == 0 || eh->e_phnum == 0) {
+        return false;
+    }
+
+    if (eh->e_phoff + (static_cast<std::size_t>(eh->e_phnum) * sizeof(Phdr)) > bytes.size()) {
+        return false;
+    }
+
+    const auto *phdrs = reinterpret_cast<const Phdr *>(bytes.data() + eh->e_phoff);
+
+    const Dyn *dyn = nullptr;
+    std::size_t dyn_count = 0;
+
+    for (std::size_t i = 0; i < eh->e_phnum; ++i) {
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            if (phdrs[i].p_offset + phdrs[i].p_filesz > bytes.size()) {
+                return false;
+            }
+            dyn = reinterpret_cast<const Dyn *>(bytes.data() + phdrs[i].p_offset);
+            dyn_count = static_cast<std::size_t>(phdrs[i].p_filesz / sizeof(Dyn));
+            break;
+        }
+    }
+
+    if (dyn == nullptr || dyn_count == 0) {
+        return false;
+    }
+
+    Addr strtab_vaddr = 0;
+    std::size_t strsz = 0;
+    std::vector<std::size_t> needed_offsets;
+
+    for (std::size_t i = 0; i < dyn_count; ++i) {
+        if (dyn[i].d_tag == DT_NULL) {
+            break;
+        }
+
+        if (dyn[i].d_tag == DT_STRTAB) {
+            strtab_vaddr = static_cast<Addr>(dyn[i].d_un.d_ptr);
+        } else if (dyn[i].d_tag == DT_STRSZ) {
+            strsz = static_cast<std::size_t>(dyn[i].d_un.d_val);
+        } else if (dyn[i].d_tag == DT_NEEDED) {
+            needed_offsets.push_back(static_cast<std::size_t>(dyn[i].d_un.d_val));
+        }
+    }
+
+    if (strtab_vaddr == 0 || strsz == 0 || needed_offsets.empty()) {
+        return false;
+    }
+
+    std::size_t strtab_off = 0;
+    if (!vaddr_to_offset<Addr>(bytes, strtab_vaddr, phdrs, eh->e_phnum, sizeof(Phdr), strtab_off)) {
+        return false;
+    }
+
+    if (strtab_off >= bytes.size()) {
+        return false;
+    }
+
+    const std::size_t max_strsz = bytes.size() - strtab_off;
+    if (strsz > max_strsz) {
+        strsz = max_strsz;
+    }
+
+    const char *strtab = reinterpret_cast<const char *>(bytes.data() + strtab_off);
+
+    for (std::size_t off : needed_offsets) {
+        if (off >= strsz) {
+            continue;
+        }
+
+        std::string name(strtab + off);
+        if (needed_library_name_looks_gui(name)) {
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -1145,6 +873,45 @@ static bool elf_dynamic_libraries_look_terminal_t(const std::vector<unsigned cha
     return false;
 }
 
+static bool raw_binary_contains_gui_symbols(const std::vector<unsigned char> &bytes) {
+    static const std::vector<std::string> symbols = {
+        "XOpenDisplay",
+        "XCreateWindow",
+        "XMapWindow",
+        "XMapRaised",
+        "XInternAtom",
+        "XGetVisualInfo",
+        "XSetWMProtocols",
+        "XtAppInitialize",
+        "XmCreate",
+        "gtk_init",
+        "gtk_application_new",
+        "gtk_window_new",
+        "QApplication",
+        "QGuiApplication",
+        "QWidget",
+        "SDL_Init",
+        "SDL_CreateWindow",
+        "glfwInit",
+        "glXChooseVisual",
+        "glXCreateContext",
+        "eglInitialize",
+        "eglCreateWindowSurface",
+        "wl_display_connect",
+        "wl_compositor_create_surface",
+        "Tk_Init"
+    };
+
+    for (const auto &sym : symbols) {
+        auto it = std::search(bytes.begin(), bytes.end(), sym.begin(), sym.end());
+        if (it != bytes.end()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool raw_binary_contains_terminal_symbols(const std::vector<unsigned char> &bytes) {
     static const std::vector<std::string> symbols = {
         "initscr",
@@ -1166,12 +933,272 @@ static bool raw_binary_contains_terminal_symbols(const std::vector<unsigned char
     return false;
 }
 
-static bool elf_looks_terminal(const std::string &path) {
-    std::vector<unsigned char> bytes;
-    if (!read_file(path, bytes)) {
+static std::unordered_map<std::string, LaunchDisposition> &launch_disposition_cache() {
+    static std::unordered_map<std::string, LaunchDisposition> cache;
+    return cache;
+}
+
+static LaunchDisposition cache_launch_disposition(const std::string &path, LaunchDisposition value) {
+    launch_disposition_cache()[path] = value;
+    return value;
+}
+
+static bool has_elf_magic_prefix(const std::string &prefix) {
+    return prefix.size() >= 4 &&
+           static_cast<unsigned char>(prefix[0]) == ELFMAG0 &&
+           static_cast<unsigned char>(prefix[1]) == ELFMAG1 &&
+           static_cast<unsigned char>(prefix[2]) == ELFMAG2 &&
+           static_cast<unsigned char>(prefix[3]) == ELFMAG3;
+}
+
+static std::optional<std::vector<std::string>> read_shebang_tokens_from_prefix(const std::string &prefix) {
+    if (!starts_with(prefix, "#!")) {
+        return std::nullopt;
+    }
+
+    std::size_t line_end = prefix.find('\n');
+    std::string line = prefix.substr(
+        2,
+        line_end == std::string::npos ? std::string::npos : line_end - 2
+    );
+
+    std::vector<std::string> tokens;
+    std::string current;
+
+    for (char ch : line) {
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            if (!current.empty()) {
+                tokens.push_back(current);
+                current.clear();
+            }
+        } else {
+            current.push_back(ch);
+        }
+    }
+
+    if (!current.empty()) {
+        tokens.push_back(current);
+    }
+
+    if (tokens.empty()) {
+        return std::nullopt;
+    }
+
+    return tokens;
+}
+
+static std::string effective_interpreter_name(const std::vector<std::string> &tokens) {
+    if (tokens.empty()) {
+        return {};
+    }
+
+    std::string interp = basename_of(tokens[0]);
+
+    if (interp == "env") {
+        for (std::size_t i = 1; i < tokens.size(); ++i) {
+            if (!tokens[i].empty() && tokens[i][0] != '-') {
+                interp = basename_of(tokens[i]);
+                break;
+            }
+        }
+    }
+
+    return to_lower(interp);
+}
+
+static bool is_known_gui_interpreter(const std::vector<std::string> &tokens) {
+    const std::string interp = effective_interpreter_name(tokens);
+
+    return interp == "wish" ||
+           interp == "wish8.6" ||
+           interp == "wish8.5" ||
+           interp == "expectk";
+}
+
+static bool is_shell_interpreter(const std::vector<std::string> &tokens) {
+    const std::string interp = effective_interpreter_name(tokens);
+
+    return interp == "sh"   ||
+           interp == "ksh"  ||
+           interp == "oksh" ||
+           interp == "mksh" ||
+           interp == "bash" ||
+           interp == "zsh"  ||
+           interp == "dash" ||
+           interp == "ash"  ||
+           interp == "csh"  ||
+           interp == "tcsh";
+}
+
+static bool script_prefix_looks_gui(const std::string &lower_prefix) {
+    static const std::vector<std::string> markers = {
+        "tkinter",
+        "pyqt",
+        "pyside",
+        "gi.repository.gtk",
+        "qtwidgets",
+        "gtk.application",
+        "import gtk",
+        "wx.app",
+        "wxpython",
+        "fltk",
+        "glfw",
+        "sdl",
+        "wish",
+        "zenity",
+        "yad"
+    };
+
+    for (const auto &m : markers) {
+        if (lower_prefix.find(m) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool script_prefix_looks_terminal(const std::string &lower_prefix) {
+    static const std::vector<std::string> markers = {
+        "curses",
+        "ncurses",
+        "readline",
+        "prompt_toolkit",
+        "urwid",
+        "blessed",
+        "npyscreen",
+        "dialog",
+        "whiptail",
+        "initscr",
+        "newterm"
+    };
+
+    for (const auto &m : markers) {
+        if (lower_prefix.find(m) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool is_terminal_command_basename(const std::string &base_lower) {
+    static const std::vector<std::string> terminal_names = {
+        "sh", "csh", "ksh", "oksh", "mksh", "bash", "zsh", "tcsh", "fish",
+        "vi", "view", "vim", "nvim", "nano", "ed", "ex",
+        "less", "more", "most", "man",
+        "top", "htop", "btop", "atop",
+        "tmux", "screen",
+        "ssh", "sftp", "ftp",
+        "lynx", "links", "elinks", "w3m",
+        "mutt", "neomutt", "mail", "mailx",
+        "irssi", "weechat", "mc", "ranger"
+    };
+
+    for (const auto &name : terminal_names) {
+        if (base_lower == name) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool is_terminal_script_interpreter_name(const std::string &interp_lower) {
+    static const std::vector<std::string> terminal_interpreters = {
+        "sh", "csh", "ksh", "oksh", "mksh", "bash", "zsh", "tcsh", "fish",
+        "python", "python2", "python3",
+        "perl", "ruby", "lua", "php",
+        "tclsh", "expect", "awk", "gawk", "mawk",
+        "node", "nodejs"
+    };
+
+    for (const auto &name : terminal_interpreters) {
+        if (interp_lower == name || starts_with(interp_lower, name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::optional<std::string> resolve_shell_wrapper_exec_target_from_prefix(
+    const std::vector<std::string> &shebang_tokens,
+    const std::string &prefix) {
+    if (!is_shell_interpreter(shebang_tokens)) {
+        return std::nullopt;
+    }
+
+    std::vector<std::pair<std::string, std::string>> vars;
+
+    std::size_t line_start = 0;
+    while (line_start <= prefix.size()) {
+        std::size_t line_end = prefix.find('\n', line_start);
+        std::string line = prefix.substr(
+            line_start,
+            line_end == std::string::npos ? std::string::npos : line_end - line_start
+        );
+
+        const std::string trimmed = trim_ascii(line);
+        if (!trimmed.empty() && trimmed[0] != '#') {
+            std::string name;
+            std::string value;
+
+            if (parse_simple_shell_assignment(trimmed, vars, name, value)) {
+                vars.emplace_back(name, value);
+            } else if (starts_with(trimmed, "exec") &&
+                       trimmed.size() > 4 &&
+                       std::isspace(static_cast<unsigned char>(trimmed[4]))) {
+                std::string target;
+                bool had_word = false;
+
+                if (!extract_first_shell_word_expanded(trimmed.substr(4), vars, target, had_word) ||
+                    !had_word || target.empty()) {
+                    return std::nullopt;
+                }
+
+                return resolve_executable(target);
+            }
+        }
+
+        if (line_end == std::string::npos) {
+            break;
+        }
+
+        line_start = line_end + 1;
+    }
+
+    return std::nullopt;
+}
+
+static bool elf_bytes_look_gui(const std::vector<unsigned char> &bytes) {
+    if (bytes.size() < EI_NIDENT) {
         return false;
     }
 
+    if (bytes[0] != ELFMAG0 || bytes[1] != ELFMAG1 ||
+        bytes[2] != ELFMAG2 || bytes[3] != ELFMAG3) {
+        return false;
+    }
+
+    bool gui_by_needed = false;
+
+    if (bytes[EI_CLASS] == ELFCLASS64) {
+        gui_by_needed =
+            elf_dynamic_libraries_look_gui_t<Elf64_Ehdr, Elf64_Phdr, Elf64_Dyn, Elf64_Addr>(bytes);
+    } else if (bytes[EI_CLASS] == ELFCLASS32) {
+        gui_by_needed =
+            elf_dynamic_libraries_look_gui_t<Elf32_Ehdr, Elf32_Phdr, Elf32_Dyn, Elf32_Addr>(bytes);
+    }
+
+    if (gui_by_needed) {
+        return true;
+    }
+
+    return raw_binary_contains_gui_symbols(bytes);
+}
+
+static bool elf_bytes_look_terminal(const std::vector<unsigned char> &bytes) {
     if (bytes.size() < EI_NIDENT) {
         return false;
     }
@@ -1198,98 +1225,80 @@ static bool elf_looks_terminal(const std::string &path) {
     return raw_binary_contains_terminal_symbols(bytes);
 }
 
-static bool script_text_looks_terminal(const std::string &path) {
+static LaunchDisposition classify_launch_disposition_impl(const std::string &resolved_path, int depth) {
+    if (depth > 4) {
+        return LaunchDisposition::DirectDetached;
+    }
+
+    auto &cache = launch_disposition_cache();
+    auto found = cache.find(resolved_path);
+    if (found != cache.end()) {
+        return found->second;
+    }
+
     std::string prefix;
-    if (!read_prefix_text(path, prefix, 16384)) {
-        return false;
+    if (!read_prefix_text(resolved_path, prefix, 32768)) {
+        return cache_launch_disposition(resolved_path, LaunchDisposition::DirectDetached);
     }
 
-    std::string lower = to_lower(prefix);
+    const std::string base_lower = to_lower(basename_of(resolved_path));
+    const auto shebang = read_shebang_tokens_from_prefix(prefix);
 
-    static const std::vector<std::string> markers = {
-        "curses",
-        "ncurses",
-        "readline",
-        "prompt_toolkit",
-        "urwid",
-        "blessed",
-        "npyscreen",
-        "dialog",
-        "whiptail",
-        "initscr",
-        "newterm"
+    std::optional<std::string> lower_prefix;
+    auto get_lower_prefix = [&]() -> const std::string & {
+        if (!lower_prefix.has_value()) {
+            lower_prefix = to_lower(prefix);
+        }
+        return *lower_prefix;
     };
 
-    for (const auto &m : markers) {
-        if (lower.find(m) != std::string::npos) {
-            return true;
+    if (has_elf_magic_prefix(prefix)) {
+        std::vector<unsigned char> bytes;
+        if (read_file(resolved_path, bytes)) {
+            if (elf_bytes_look_gui(bytes)) {
+                return cache_launch_disposition(resolved_path, LaunchDisposition::DirectDetached);
+            }
+            if (elf_bytes_look_terminal(bytes)) {
+                return cache_launch_disposition(resolved_path, LaunchDisposition::LaunchInXterm);
+            }
         }
-    }
-
-    return false;
-}
-
-static bool command_prefers_xterm(const std::string &resolved_path) {
-    if (command_looks_gui(resolved_path)) {
-        return false;
-    }
-
-    if (elf_looks_terminal(resolved_path)) {
-        return true;
-    }
-
-    std::string base = to_lower(basename_of(resolved_path));
-    static const std::vector<std::string> terminal_names = {
-        "sh", "csh", "ksh", "oksh", "mksh", "bash", "zsh", "tcsh", "fish",
-        "vi", "view", "vim", "nvim", "nano", "ed", "ex",
-        "less", "more", "most", "man",
-        "top", "htop", "btop", "atop",
-        "tmux", "screen",
-        "ssh", "sftp", "ftp",
-        "lynx", "links", "elinks", "w3m",
-        "mutt", "neomutt", "mail", "mailx",
-        "irssi", "weechat", "mc", "ranger"
-    };
-
-    for (const auto &name : terminal_names) {
-        if (base == name) {
-            return true;
+    } else {
+        if (shebang && is_known_gui_interpreter(*shebang)) {
+            return cache_launch_disposition(resolved_path, LaunchDisposition::DirectDetached);
         }
-    }
 
-    auto shebang = read_shebang_tokens(resolved_path);
-    if (!shebang) {
-        return false;
-    }
+        if (script_prefix_looks_gui(get_lower_prefix())) {
+            return cache_launch_disposition(resolved_path, LaunchDisposition::DirectDetached);
+        }
 
-    std::string interp = basename_of((*shebang)[0]);
-
-    if (interp == "env") {
-        for (std::size_t i = 1; i < shebang->size(); ++i) {
-            if (!(*shebang)[i].empty() && (*shebang)[i][0] != '-') {
-                interp = basename_of((*shebang)[i]);
-                break;
+        if (shebang) {
+            auto wrapped_target = resolve_shell_wrapper_exec_target_from_prefix(*shebang, prefix);
+            if (wrapped_target && *wrapped_target != resolved_path) {
+                const LaunchDisposition nested =
+                    classify_launch_disposition_impl(*wrapped_target, depth + 1);
+                return cache_launch_disposition(resolved_path, nested);
             }
         }
     }
 
-    interp = to_lower(interp);
+    if (is_terminal_command_basename(base_lower)) {
+        return cache_launch_disposition(resolved_path, LaunchDisposition::LaunchInXterm);
+    }
 
-    static const std::vector<std::string> terminal_interpreters = {
-        "sh", "csh", "ksh", "oksh", "mksh", "bash", "zsh", "tcsh", "fish",
-        "python", "python2", "python3",
-        "perl", "ruby", "lua", "php",
-        "tclsh", "expect", "awk", "gawk", "mawk",
-        "node", "nodejs"
-    };
-
-    for (const auto &name : terminal_interpreters) {
-        if (interp == name || starts_with(interp, name)) {
-            return script_text_looks_terminal(resolved_path);
+    if (shebang) {
+        const std::string interp_lower = effective_interpreter_name(*shebang);
+        if (is_terminal_script_interpreter_name(interp_lower) &&
+            script_prefix_looks_terminal(get_lower_prefix())) {
+            return cache_launch_disposition(resolved_path, LaunchDisposition::LaunchInXterm);
         }
     }
 
-    return false;
+    return cache_launch_disposition(resolved_path, LaunchDisposition::DirectDetached);
+}
+
+static bool command_prefers_xterm_fast(const std::string &resolved_path) {
+    return classify_launch_disposition_impl(resolved_path, 0) ==
+           LaunchDisposition::LaunchInXterm;
 }
 
 static LaunchPrep prepare_launch(const std::string &raw_input) {
@@ -1307,7 +1316,7 @@ static LaunchPrep prepare_launch(const std::string &raw_input) {
         return prep;
     }
 
-    const bool launch_in_xterm = command_prefers_xterm(*resolved);
+    const bool launch_in_xterm = command_prefers_xterm_fast(*resolved);
 
     if (!launch_in_xterm) {
         prep.exec_argv = parsed.argv;
@@ -1401,16 +1410,16 @@ static bool spawn_detached(std::vector<std::string> exec_argv, std::string &erro
     }
 
     if (!set_cloexec(pipefd[0]) || !set_cloexec(pipefd[1])) {
-        int saved = errno;
+        const int saved = errno;
         close(pipefd[0]);
         close(pipefd[1]);
         error = errno_message("fcntl(FD_CLOEXEC) failed", saved);
         return false;
     }
 
-    pid_t pid = fork();
+    const pid_t pid = fork();
     if (pid < 0) {
-        int saved = errno;
+        const int saved = errno;
         close(pipefd[0]);
         close(pipefd[1]);
         error = errno_message("fork failed", saved);
@@ -1425,7 +1434,7 @@ static bool spawn_detached(std::vector<std::string> exec_argv, std::string &erro
             _exit(127);
         }
 
-        pid_t pid2 = fork();
+        const pid_t pid2 = fork();
         if (pid2 < 0) {
             write_errno_to_pipe(pipefd[1], errno);
             _exit(127);
@@ -1452,7 +1461,7 @@ static bool spawn_detached(std::vector<std::string> exec_argv, std::string &erro
             _exit(127);
         }
 
-        int devnull = open("/dev/null", O_RDWR);
+        const int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             (void)dup2(devnull, STDIN_FILENO);
             (void)dup2(devnull, STDOUT_FILENO);
@@ -1474,7 +1483,7 @@ static bool spawn_detached(std::vector<std::string> exec_argv, std::string &erro
     close(pipefd[1]);
 
     int read_err = 0;
-    std::optional<int> child_exec_errno = read_child_exec_errno(pipefd[0], read_err);
+    const std::optional<int> child_exec_errno = read_child_exec_errno(pipefd[0], read_err);
     close(pipefd[0]);
 
     int status = 0;
@@ -1671,12 +1680,12 @@ int main(int argc, char **argv) {
     );
 
     Display *dpy = XtDisplay(app.toplevel);
-    int screen = DefaultScreen(dpy);
-    int sw = DisplayWidth(dpy, screen);
-    int sh = DisplayHeight(dpy, screen);
+    const int screen = DefaultScreen(dpy);
+    const int sw = DisplayWidth(dpy, screen);
+    const int sh = DisplayHeight(dpy, screen);
 
-    int pos_x = (sw - static_cast<int>(kWindowWidth)) / 2;
-    int pos_y = (sh - static_cast<int>(kWindowHeight)) / 2;
+    const int pos_x = (sw - static_cast<int>(kWindowWidth)) / 2;
+    const int pos_y = (sh - static_cast<int>(kWindowHeight)) / 2;
 
     XtVaSetValues(
         app.toplevel,
